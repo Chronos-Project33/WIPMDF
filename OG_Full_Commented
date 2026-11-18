@@ -1,0 +1,1414 @@
+/////////Section  Tab 1: Main //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// DOCUMENTATION NOTE - HOW TO READ THIS SCRIPT
+// This app is a QVD GENERATOR: it contains no sheets that users consume. It reads cost / plan / forecast data for
+// Mission Execution (ME) discretionary projects from Databricks, shapes it into a link-table star schema and
+// writes 14 QVD files that the dashboard app loads. Flow:  Section 2 EXTRACT (staging tables stg_*)
+//  -> Section 3 DIMENSIONS (dim_*) -> Section 4 FACTS (fact_*) -> Section 5 LINK TABLE -> Section 6 STORE.
+// Glossary: WBS = work breakdown structure element (cost account) | MML = most likely forecast | PV0 = resource
+// allocation | AOP/Plan = approved plan | B&P = bid & proposal | E&D = engineering & development | IR&D =
+// independent research & development | AMEP = Advanced Engines (program) | IO = internal order.
+//
+// LOCALE / FORMAT SETTINGS (Qlik defaults for en-US). Dates are M/D/YYYY and money is $#,##0.00 everywhere.
+SET ThousandSep					=',';
+SET DecimalSep					='.';
+SET MoneyThousandSep			=',';
+SET MoneyDecimalSep				='.';
+SET MoneyFormat					='$#,##0.00;-$#,##0.00';
+SET TimeFormat					='h:mm:ss TT';
+SET DateFormat					='M/D/YYYY';
+SET TimestampFormat				='M/D/YYYY h:mm:ss[.fff] TT';
+SET FirstWeekDay				=6;
+SET BrokenWeeks					=1;
+SET ReferenceDay				=0;
+SET FirstMonthOfYear			=1;
+SET CollationLocale				='en-US';
+// SET CreateSearchIndexOnReload	=1;
+SET MonthNames					='Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec';
+SET LongMonthNames				='January;February;March;April;May;June;July;August;September;October;November;December';
+SET DayNames					='Mon;Tue;Wed;Thu;Fri;Sat;Sun';
+SET LongDayNames				='Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday';
+SET NumericalAbbreviation		='3:k;6:M;9:B;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+
+
+// FOLDERS: vQvds = shared QVD storage data connection | vFinRaw = raw copy of every source query (one QVD each,
+// lets us reload without Databricks) | vFinQvds = FINAL model QVDs that the dashboard app reads.
+SET vQvds 						= 'lib://PM Express QVD Storage';
+SET vFinQvds 					= '$(vQvds)/ME-Financials-Star/model';
+SET vFinRaw 					= '$(vQvds)/ME-Financials-Star/raw';
+
+
+
+// SOURCE LOCATION: Databricks catalog + schema. vSrc is the fully-qualified prefix used in every SQL FROM below.
+SET vSrcCatalog 				= 'hive_metastore';
+SET vSrcSchema 					= 'prd_pmx_stg_pm_express';
+SET vSrc 						= '$(vSrcCatalog).$(vSrcSchema)';
+
+
+// RUN SWITCHES
+//  vLoadFromSource : 1 = query Databricks and refresh raw QVDs | 0 = skip Databricks, rebuild the model from raw QVDs
+//  vZeroPartialMonth: 1 = zero the current month's SAP actuals until the close day (see gate below)
+//  vEnableRecon     : 1 = compare staging row count with the true source row count to catch join fan-out
+SET vLoadFromSource 			= 1; // pull from databricks + write raw QVD; 0 = reload from raw qvd
+SET vZeroPartialMonth 			= 1; // blank current partial-month actuals
+SET vEnableRecon 				= 1; // pull true source row-count to detect join fan-out
+
+// Open the Databricks connection (only needed when vLoadFromSource = 1).
+LIB CONNECT TO 'PM Express Databricks WS55';
+
+// Timestamp used by TRACE messages to show how long each stage takes (vT is re-set after each stage).
+LET vT = Now();
+TRACE >>> [Financials] Variables Set. Load started $(vT);
+
+// Mid-month close gate: zero current-month actuals only before the 17th. TODAY-only.
+
+// CLOSE-DAY GATE: vCurYear / vCurMonth = today's year and month. vBeforeClose = 1 on days 1-16 of the month.
+// While it is 1 the current month's actuals are treated as incomplete and are zeroed in fact_wbs_month (section 4).
+// Based on Today() only, so it changes by itself - no manual switch needed at month end.
+LET vCurYear = Num(Year(Today()));
+LET vCurMonth = Num(Month(Today()));
+LET vCloseDay = 17;
+LET vBeforeClose = If(Day(Today()) < $(vCloseDay), 1, 0);
+TRACE >>> Gate: curYr=$(vCurYear) curMo=$(vCurMonth) beforeClose=$(vBeforeClose);
+
+
+
+// SECTION Tab 2 - EXTRACT ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//brings source data into staging tables (stg_*) and lookup sources.
+// Month number -> short month name. Used by dim_date.month_name.
+stg_date_names:
+Mapping LOAD * INLINE [
+  month, month_name
+  1, Jan
+  2, Feb
+  3, Mar
+  4, Apr
+  5, May
+  6, Jun
+  7, Jul
+  8, Aug
+  9, Sep
+  10, Oct
+  11, Nov
+  12, Dec
+];
+
+// F135 reporting categories: HARD-CODED mapping from project (first 7 characters of the WBS, e.g. ME.5601) to a
+// business reporting_category. Projects not listed get NULL (not F135). Edit this list when F135 categories change.
+map_F135:
+Mapping LOAD * INLINE [
+    project, reporting_category
+    ME.5601,    Production WoC
+    ME.5008,    Production WoC
+    ME.7813,    Safety
+    ME.7814,    Safety
+    ME.7812,    Sustainment WoC
+    ME.7340,    Sustainment WoC
+    ME.7034,    ECU
+    ME.6973,    ECU
+    ME.8105,    CPT
+    ME.8104,    CPT
+    ];  
+  
+// MODE A (vLoadFromSource = 1): query Databricks, keep each result in memory as a staging table and also
+// write it to a raw QVD. MODE B ('Else' further down) reloads exactly the same tables from those raw QVDs.
+If $(vLoadFromSource) = 1 then
+
+  // Recon step 1: get the TRUE row count of the main fact view before any transformation. It is compared with
+  // the loaded stg_fin row count at the end of Extract.
+  If $(vEnableRecon) then
+    recon_src:
+    LOAD [n] AS _src_rows;
+    SQL SELECT COUNT(*) AS n FROM $(vSrc).v_pme_mml_cost_all_versions_two_years_qlik_vw;
+//     SQL SELECT COUNT(*) AS n FROM $(vSrc).v_wbs_mml_plan_program_all_versions_two_years_vw;
+     
+    
+    LET vSrcRows = Peek('_src_rows', 0, 'recon_src');
+    DROP TABLE recon_src;
+    TRACE >>> [Financials] Source fact rows (pre-transform) = $(vSrcRows);
+  end if
+
+  // stg_fin = MAIN COST FACT: one row per WBS x fiscal month x budget VERSION with actual_cost, mml_cost (MML
+  // forecast) and plan_cost. The 'two_years' view holds the current and prior year only. Dimensions, plan, actuals
+  // history and MML history are all derived from this table.
+  stg_fin:
+  LOAD *;
+  SQL SELECT
+    f.wbs_element,
+    f.wbs_element_description,
+    f.program_area,
+    f.sub_program_area,
+
+    f.version,
+    CAST(f.version_year AS INT) AS version_year,
+    f.version_month,
+    CAST(f.version_month_num AS INT) AS version_month_num,
+    CAST(f.fiscal_year AS INT) AS fiscal_year,
+    CAST(f.fiscal_period_month_num AS INT) as fiscal_period_month_num,
+// editted line 61 to 64 to point historical mml data on 9/29/26
+    CAST(f.actual AS DOUBLE) AS actual_cost, 
+    CAST(f.mml AS DOUBLE) AS mml_cost,
+    CAST(f.plan AS DOUBLE) AS plan_cost
+  FROM $(vSrc).v_pme_mml_cost_all_versions_two_years_qlik_vw f;
+  
+  // Save the raw copy so a later run with vLoadFromSource = 0 does not need Databricks.
+  STORE stg_fin INTO [$(vFinRaw)/fin_raw.qvd](qvd);
+
+  // (Unused helper) distinct WBS list from stg_fin and stg_bnp. The field %fin_wbs is not referenced anywhere
+  // else; the table is dropped after the If/Else. Safe to delete.
+  tmp_fin_wbs:
+  LOAD DISTINCT wbs_element AS %fin_wbs RESIDENT stg_fin;
+  
+  // yearly program allocation (separate view, FY grain, versioned)
+
+  // stg_alloc = ANNUAL PROGRAM ALLOCATION by WBS and budget VERSION (history of allocations by version).
+  // Feeds fact_allocation_history.
+  stg_alloc:
+  LOAD *;
+  SQL SELECT
+  	wbs_element,
+    version,
+    CAST(fiscal_year AS INT)					AS fiscal_year,
+    CAST(fiscal_year_program_allocation AS DOUBLE) AS fiscal_year_program_allocation
+  FROM $(vSrc).v_pme_program_allocation_all_versions_two_years_qlik_vw;
+  STORE stg_alloc INTO [$(vFinRaw)/alloc_raw.qvd](qvd);
+  
+  // stg_alloc_cur = CURRENT annual Program Allocation summed from the live cost-data table
+  // (budgeting_metric = 'Program_Allocation'). Blank WBS are replaced by '<project> - unspecified' so those dollars
+  // are not lost. Feeds fact_allocation_year.
+  stg_alloc_cur:
+  LOAD *;
+  SQL SELECT
+  	//wbs_element,
+    COALESCE(NULLIF(wbs_element, ''), CONCAT(project, ' - unspecified')) AS wbs_element,
+    CAST(year AS INT) AS fiscal_year,
+    CAST(SUM(CAST(planned_dollar_amount AS DOUBLE)) AS DOUBLE) AS fiscal_year_program_allocation
+    FROM $(vSrc).pme_mml_cost_data
+    WHERE COALESCE(wbs_element, project) IS NOT NULL
+    	AND budgeting_metric = 'Program_Allocation'
+    GROUP BY wbs_element, project, year;
+    STORE stg_alloc_cur INTO [$(vFinRaw)/alloc_cur_raw.qvd](qvd);
+    
+  // stg_bnp = B&P PLAN AND MML by WBS x opportunity x fiscal month, summed so each combination is one row.
+  // Feeds B&P plan/MML amounts, the opportunity dimension and the WBS-to-opportunity map.
+  stg_bnp:
+  LOAD *;
+  SQL SELECT 
+  	wbs_element,
+    project,
+    program_area,
+    sub_program_area,
+    opportunity_number,
+    opportunity,
+    mp_number,
+    CAST(fiscal_year AS INT) AS fiscal_year,
+    CAST(month AS INT) AS fiscal_period_month_num,
+    CAST(SUM(plan) AS DOUBLE) 							AS plan_cost,
+    CAST(SUM(mml) AS DOUBLE) 							AS mml_cost
+    FROM $(vSrc).v_bnp_year_month_costs_vw
+    WHERE wbs_element IS NOT NULL
+    GROUP BY wbs_element, 
+    	project,
+    	program_area, 
+        sub_program_area, 
+        opportunity_number, 
+    	opportunity, 
+        mp_number, 
+        fiscal_year, 
+        month;
+  STORE stg_bnp INTO [$(vFinRaw)/bnp_raw.qvd](qvd);
+
+  CONCATENATE(tmp_fin_wbs)
+  LOAD DISTINCT wbs_element AS %fin_wbs RESIDENT stg_bnp;
+  
+  // stg_bnp_alloc = ANNUAL B&P BUDGET per WBS x opportunity x fiscal year (treated as program allocation for B&P).
+  stg_bnp_alloc:
+  LOAD *;
+  SQL SELECT
+  	wbs_element,
+    opportunity_number,
+    CAST(fiscal_year AS INT) 							AS fiscal_year,
+    CAST(SUM(CAST(BUDGET AS DOUBLE)) AS DOUBLE) 		AS fiscal_year_program_allocation
+  FROM $(vSrc).v_bnp_year_costs_vw
+  WHERE wbs_element IS NOT NULL
+  GROUP BY wbs_element, 
+  	opportunity_number, 
+    fiscal_year;
+  
+  STORE stg_bnp_alloc INTO [$(vFinRaw)/bnp_alloc_raw.qvd](qvd);
+  // 10/22/2026 - CPM - AMEP Plan from the Jan Snapshot view. Per business all AMEP plan comes from here, including WBS that later dropped out of live B&P view
+
+  // stg_amep_plan = AMEP PLAN from the January snapshot view (program 'Advanced Engines (AMEP)'). Per the business
+  // all AMEP plan comes from here, including WBS that later dropped out of the live B&P view.
+  stg_amep_plan:
+  NoConcatenate
+  LOAD *;
+  SQL SELECT
+  	wbs_element, 
+    CAST(fiscal_year AS INT) 							AS fiscal_year,
+    CAST(month AS INT) 									AS fiscal_period_month_num,
+    CAST(SUM(month_plan_value) AS DOUBLE) 				AS plan_cost
+  FROM $(vSrc).v_bnp_january_snapshots_monthly_allocations_vw
+  WHERE program_name = 'Advanced Engines (AMEP)'
+  	AND wbs_element IS NOT NULL
+  GROUP BY wbs_element, fiscal_year, month;
+  STORE stg_amep_plan INTO [$(vFinRaw)/amep_plan_raw.qvd](qvd);
+
+  // stg_mml_prior = PRIOR-YEAR HISTORY from pme_mml_cost_data: 'Plan' (only years before 2026) and 'Forecast' (=MML)
+  // by WBS x month. Covers periods that the versioned fin view does not.
+  stg_mml_prior:
+  NOCONCATENATE
+  LOAD *;
+  SQL SELECT
+  	wbs_element,
+    program_area,
+    sub_program_area,
+    CAST(year AS INT) 									AS fiscal_year,
+    CAST(month AS INT) 									AS fiscal_period_month_num,
+    CAST(SUM(CASE WHEN budgeting_metric = 'Plan' 
+    	AND CAST(year AS INT) < 2026 
+        THEN planned_dollar_amount END) AS DOUBLE) 		AS plan_cost,
+    CAST(SUM(CASE WHEN budgeting_metric = 'Forecast' 
+    	THEN planned_dollar_amount END) AS DOUBLE) 		AS mml_cost
+  FROM $(vSrc).pme_mml_cost_data
+  WHERE wbs_element IS NOT NULL
+  GROUP BY wbs_element, 
+  	program_area, 
+    sub_program_area, 
+    year, 
+    month;
+  STORE stg_mml_prior INTO [$(vFinRaw)/mml_prior_raw.qvd](qvd);
+  
+  // WBS -> project type lookup SOURCE: union of the discretionary cost data and the B&P view. Converted to the
+  // mapping map_wbs_type, which dim_wbs uses to classify E&D / IR&D / B&P.
+  map_wbs_type_src:
+  LOAD wbs_element, project_type AS raw_type;
+  SQL 
+  SELECT 
+  	wbs_element, 
+    project_type
+  FROM $(vSrc).pme_mml_cost_data
+  WHERE wbs_element IS NOT NULL;
+
+  CONCATENATE(map_wbs_type_src)
+  LOAD wbs_element, "Project_Type" AS raw_type;
+  SQL
+  SELECT wbs_element, Project_Type
+  FROM $(vSrc).bnp_qlik_vw
+  WHERE wbs_element IS NOT NULL;
+  STORE map_wbs_type_src INTO [$(vFinRaw)/wbs_type_raw.qvd](qvd);
+
+  map_wbs_type:
+  MAPPING LOAD 
+  	wbs_element, raw_type 
+  RESIDENT map_wbs_type_src;
+  DROP TABLE map_wbs_type_src;
+
+  // wbs_element -> program_manager map
+
+  // WBS -> program manager lookup SOURCE (same two systems). Converted to mapping map_wbs_pm.
+  map_wbs_pm_src:
+  LOAD wbs_element, program_manager AS pm;
+  SQL SELECT wbs_element, program_manager
+      FROM $(vSrc).pme_mml_cost_data
+      WHERE wbs_element IS NOT NULL;
+
+  CONCATENATE(map_wbs_pm_src)
+  LOAD wbs_element, "Program_Manager" as pm;
+  SQL SELECT wbs_element, Program_Manager
+      FROM $(vSrc).bnp_qlik_vw
+      WHERE wbs_element IS NOT NULL;
+
+  STORE map_wbs_pm_src INTO [$(vFinRaw)/wbs_pm_raw.qvd](qvd);
+  
+  map_wbs_pm:
+  MAPPING LOAD wbs_element, pm RESIDENT map_wbs_pm_src;
+  DROP TABLE map_wbs_pm_src;
+
+  // Project POC attributes (keyed on wbs_element)
+
+  // stg_wbs_poc = PROJECT CONTACTS / ATTRIBUTES per WBS: title, PM, finance and technical names, current-year
+  // budget, period of performance. Discretionary projects first, then sales projects (budget/dates NULL).
+  stg_wbs_poc:
+  LOAD *;
+  SQL SELECT 
+  	wbs_element,
+    title						AS project_title,
+    pm_name,
+    finance_name,
+    technical_name,
+    CAST(current_year_budget AS DOUBLE) AS current_year_budget,
+    pop_start,
+    pop_end
+  FROM $(vSrc).pme_discretionary_project;
+  
+  CONCATENATE(stg_wbs_poc)
+  LOAD *;
+  SQL SELECT
+  	wbs_element,
+    title 						AS project_title,
+    pm_name,
+    finance_name,
+    technical_name,
+    CAST(NULL AS DOUBLE) 		AS current_year_budget,
+    CAST(NULL AS DATE) 			AS pop_start,
+    CAST(NULL AS DATE) 			AS pop_end
+  FROM $(vSrc).pme_sales_project;
+  
+  STORE stg_wbs_poc INTO [$(vFinRaw)/wbs_poc_raw.qvd](qvd);
+  
+  // stg_wbs_hier = WBS HIERARCHY (wbs1..wbs5 codes + descriptions, program area) from the accounting summary.
+  // Sales projects are excluded.
+  stg_wbs_hier:
+  LOAD *;
+  SQL SELECT
+	wbs_element,
+	project_description,
+    program_area,
+    sub_program_area,
+    wbs1,
+    wbs1_description,
+    wbs2,
+    wbs2_description,
+    wbs3,
+    wbs3_description,
+    wbs4,
+    wbs4_description,
+    wbs5,
+    wbs5_description
+  FROM hive_metastore.prd_pmx_dp_accounting.wbs_summary
+  WHERE project_type <> 'Sales';
+  
+  STORE stg_wbs_hier INTO [$(vFinRaw)/wbs_hier_raw.qvd](qvd);
+  
+  // Puspal - 2026-09-08 9:09AM - exclude wbs_elements which have entries 
+  //   in wbs_monthly_costs but not wbs_summary (in WHERE clause below)
+
+  // stg_sap = SAP MONTHLY ACTUALS and PV0 (resource allocation) by WBS x network / activity / NAE x cost center x
+  // profit center x fiscal month. Only discretionary SAP project types (YA YC YI YR YB YD YJ YK); WBS ME.7334* and a
+  // fixed exclusion list are removed. Summed to one row per combination. Puspal 9/8/26: WBS present in costs but
+  // missing from wbs_summary are excluded.
+  stg_sap:
+  LOAD *;
+  SQL SELECT
+	wbs_element,
+	profitability_metric,
+	network,
+	network_short_text,
+	nae_element,
+	nae_element_short_text,
+    activity,
+    activity_short_text,
+	cost_center,
+	cost_center_text,
+	profit_center,
+	profit_center_description,
+	sap_proj_type,
+	CAST(fiscal_year AS INT) AS fiscal_year,
+	CAST(fiscal_period_month AS INT) AS fiscal_period_month,
+	CAST(SUM(CASE WHEN budgeting_metric = 'actuals' THEN dollar_amount END) AS DOUBLE) AS actual_cost_raw,
+	CAST(SUM(CASE WHEN budgeting_metric = 'PV0' THEN dollar_amount END) AS DOUBLE) AS pv0_cost_raw
+  FROM hive_metastore.prd_pmx_dp_accounting.wbs_monthly_costs c
+  WHERE sap_proj_type IN ('YA', 'YC', 'YI', 'YR', 'YB', 'YD', 'YJ', 'YK')
+  	AND wbs_element NOT LIKE 'ME.7334%'
+  	AND wbs_element NOT IN (
+  		'CE.0100-BB-02','CE.1239-01-01','CE.1239-01-03','CE.1239-01-08','CE.1239-01-12',
+        'CE.1239-01-15','ME.0100-BB-02','ME.1110-99','ME.1120-00','ME.1160-99',
+        'ME.1386-04-00','ME.1386-99-99'
+  	)
+  	GROUP BY 
+		wbs_element, 
+        profitability_metric, 
+        network, 
+        network_short_text, 
+        nae_element, 
+        nae_element_short_text, 
+        activity, 
+        activity_short_text, 
+        cost_center, 
+        cost_center_text, 
+        profit_center, 
+        profit_center_description, 
+        sap_proj_type, 
+        fiscal_year, 
+        fiscal_period_month;
+  STORE stg_sap INTO [$(vFinRaw)/sap_raw.qvd](qvd);
+  
+  // stg_io_cost = INTERNAL-ORDER ACTUAL COST per order x month. Order numbers are normalised by stripping leading
+  // zeros (the REPLACE/LTRIM/REPLACE trick) so keys match across tables.
+  stg_io_cost:
+  LOAD *;
+  SQL SELECT
+	REPLACE(LTRIM(REPLACE(internal_order_number, '0', ' ')), ' ', '0') AS internal_order,
+    internal_order_description AS io_description,
+    CAST(year AS INT) AS fiscal_year,
+    CAST(month AS INT) as fiscal_period_month,
+    CAST(SUM(actual_cost) AS DOUBLE) AS actual_cost
+    FROM hive_metastore.prd_pmx_dp_accounting.internal_order_costs_me
+//  FROM hive_metastore.prd_pmx_stg_data_products.internal_order_costs_me
+ // Added Me table  
+  WHERE LEN(internal_order_number) > 2
+	GROUP BY 
+		REPLACE(LTRIM(REPLACE(internal_order_number, '0', ' ')), ' ', '0'), 
+		internal_order_description,
+        year,
+		month;
+  STORE stg_io_cost INTO [$(vFinRaw)/io_cost_raw.qvd](qvd);
+
+  // stg_io_master = INTERNAL-ORDER MASTER DATA: annual budget, allotted, open commitment.
+  stg_io_master:
+  LOAD *;
+  SQL SELECT
+	REPLACE(LTRIM(REPLACE(internal_order_number, '0', ' ')), ' ', '0') AS internal_order,
+	CAST(budget AS DOUBLE)	 AS annual_budget,
+	CAST(allotted AS DOUBLE) AS allotted,
+	CAST(open_commitment AS DOUBLE) AS open_commitment
+     FROM hive_metastore.prd_pmx_dp_accounting.internal_order_master_me
+ // old table  FROM hive_metastore.prd_pmx_stg_data_products.internal_order_master
+  // Add ME table prd_pmx_dp_accounting/internal_order_costs_me
+  WHERE LEN(internal_order_number) > 2;
+  STORE stg_io_master INTO [$(vFinRaw)/io_master_raw.qvd](qvd);
+  
+  // stg_io_capital = CAPITAL SHEET by internal order x month: MML, plan and program allocation cost plus owners
+  // (ECAR, program manager, finance POC, program area, budget owner).
+  stg_io_capital:
+  LOAD *;
+  SQL SELECT
+	internal_order_number AS internal_order,
+	internal_order_description AS io_description,
+	ecar,
+	program_manager,
+	finance_poc,
+	program_area,
+	budget_owner,
+	CAST(year AS INT) AS fiscal_year,
+    CAST(month AS INT) AS fiscal_period_month,
+	CAST(mml_month_cost AS DOUBLE) AS mml_cost,
+	CAST(plan_month_cost AS DOUBLE) AS plan_cost,
+	CAST(program_allocation_month_cost AS DOUBLE) AS program_allocation_cost
+  FROM $(vSrc).me_disc_capital_sheet_qlik_vw;
+  STORE stg_io_capital INTO [$(vFinRaw)/io_capital_raw.qvd](qvd);
+ 
+ 
+
+
+// MODE B (vLoadFromSource = 0): load the same staging tables from the raw QVDs written by Mode A.
+// Nothing here touches Databricks, so this is fast and repeatable (useful for testing).
+Else
+	stg_fin:
+    LOAD * FROM [$(vFinRaw)/fin_raw.qvd](qvd);
+    
+//     stg_F135:
+//     LOAD * FROM [$(vFinRaw)/f135_inline_raw.qvd](qvd);
+  	
+    tmp_fin_wbs:
+  	LOAD DISTINCT wbs_element AS %fin_wbs RESIDENT stg_fin;
+    
+    stg_alloc:
+    LOAD * FROM [$(vFinRaw)/alloc_raw.qvd](qvd);
+    
+    stg_alloc_cur:
+    LOAD * FROM [$(vFinRaw)/alloc_cur_raw.qvd](qvd);
+    
+    stg_bnp:
+	LOAD * FROM [$(vFinRaw)/bnp_raw.qvd](qvd);
+    
+    CONCATENATE(tmp_fin_wbs)
+    LOAD DISTINCT wbs_element AS %fin_wbs RESIDENT stg_bnp;
+    
+    stg_bnp_alloc:
+    LOAD * FROM [$(vFinRaw)/bnp_alloc_raw.qvd](qvd);
+    // 10/22/2026 - CPM - reload AMEP snapshot plan from existing raw QVD
+    stg_amep_plan:
+    NoConcatenate
+    LOAD * FROM [$(vFinRaw)/amep_plan_raw.qvd](qvd);
+    
+    stg_mml_prior:
+    LOAD * FROM [$(vFinRaw)/mml_prior_raw.qvd](qvd);
+    
+    stg_wbs_poc:
+	LOAD * FROM [$(vFinRaw)/wbs_poc_raw.qvd](qvd);
+
+	stg_wbs_hier:
+	LOAD * FROM [$(vFinRaw)/wbs_hier_raw.qvd](qvd);
+    
+	stg_sap:
+	LOAD * FROM [$(vFinRaw)/sap_raw.qvd](qvd);
+    
+    stg_io_cost:
+	LOAD * FROM [$(vFinRaw)/io_cost_raw.qvd](qvd);
+    
+    stg_io_master:
+	LOAD * FROM [$(vFinRaw)/io_master_raw.qvd](qvd);
+    
+	stg_io_capital:
+    LOAD * FROM [$(vFinRaw)/io_capital_raw.qvd](qvd);
+    
+    map_wbs_type_src:
+	LOAD * FROM [$(vFinRaw)/wbs_type_raw.qvd](qvd);
+	map_wbs_type:
+	MAPPING LOAD wbs_element, raw_type RESIDENT map_wbs_type_src;
+	DROP TABLE map_wbs_type_src;
+    
+    map_wbs_pm_src:
+    LOAD * FROM [$(vFinRaw)/wbs_pm_raw.qvd](qvd);
+	map_wbs_pm:
+	MAPPING LOAD wbs_element, pm RESIDENT map_wbs_pm_src;
+	DROP TABLE map_wbs_pm_src;
+    
+End If
+
+// Remove the unused helper table.
+DROP TABLE tmp_fin_wbs;
+
+LET vT = Now();
+TRACE >>> Extract Done: $(vT);
+
+// RECON step 2: if stg_fin now has MORE rows than the source view, a join multiplied rows and every
+// dollar total would be inflated - log a warning.
+LET vFinRows = NoOfRows('stg_fin');
+TRACE >>> stg_fin rows: $(vFinRows);
+If $(vEnableRecon) = 1 AND $(vLoadFromSource) = 1 then
+	If $(vFinRows) > $(vSrcRows) then
+    	TRACE *** WARNING: stg_fin ($(vFinRows) > source ($(vSrcRows)) - a join fanned out ***;
+    Endif
+Endif
+
+
+
+
+// SECTION Tab 3 - Tranforms Dims /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// dim_date part 1: find the earliest and latest month in fin, SAP and IO-cost data (as first-of-month dates).
+tmp_minmax:
+LOAD
+	Min(MakeDate(fiscal_year, fiscal_period_month_num, 1)) 				AS min_d,
+	Max(MakeDate(fiscal_year, fiscal_period_month_num, 1)) 				AS max_d
+RESIDENT stg_fin;
+
+CONCATENATE(tmp_minmax)
+LOAD
+	Min(MakeDate(fiscal_year, fiscal_period_month, 1)) 				AS min_d,
+	Max(MakeDate(fiscal_year, fiscal_period_month, 1)) 				AS max_d
+RESIDENT stg_sap;
+
+CONCATENATE(tmp_minmax)
+LOAD
+	Min(MakeDate(fiscal_year, fiscal_period_month, 1)) AS min_d,
+    Max(MakeDate(fiscal_year, fiscal_period_month, 1)) AS max_d
+RESIDENT stg_io_cost;
+
+// Collapse the three min/max rows to one overall min and max; keep them in vMinDate / vMaxDate.
+tmp_minmax2:
+NoConcatenate LOAD Min(min_d) AS min_d, Max(max_d) AS max_d RESIDENT tmp_minmax;
+LET vMinDate = Num(Peek('min_d', 0, 'tmp_minmax2'));
+LET vMaxDate = Num(Peek('max_d', 0, 'tmp_minmax2'));
+DROP TABLES tmp_minmax, tmp_minmax2;
+
+
+// dim_date: generated master calendar. Key = year_month (text 'YYYYMM')
+// dim_date = MONTH CALENDAR. Built with preceding loads (read bottom-up):
+//  (3) generate one row per month from vMinDate to vMaxDate
+//  (2) add year, month, year_month (YYYYMM = the key facts link on) and month_name
+//  (1) add display labels (month_display 'Jan-26' sorted by YYYYMM) and cur_month_flag (1 = current month;
+//      used by the 'To Go MML' measure).
+dim_date: 
+LOAD 
+	*, 
+    Dual(Date(month_start_date, 'MMM-YY'), year_month) 					AS month_display,
+	Date(month_start_date, 'YYYY-MM') 									AS yyyymm,
+	Date(month_start_date, 'MM/DD/YYYY') 								AS full_date,
+	If(Year(month_start_date) =$(vCurYear) AND 
+    	Num(Month(month_start_date))=$(vCurMonth),1,0) 					AS cur_month_flag;
+LOAD 
+	Year(month_start_date) 												AS year,
+    Num(Month(month_start_date))										AS month,
+    Year(month_start_date)*100 + Num(Month(month_start_date)) AS year_month,
+    month_start_date,
+    ApplyMap('stg_date_names', Num(Month(month_start_date)), 'Unknown') AS month_name;
+LOAD 
+ 	AddMonths(Date($(vMinDate)), IterNo()-1) AS month_start_date
+AutoGenerate 1
+WHILE AddMonths(Date($(vMinDate)), IterNo()-1) <= Date($(vMaxDate));
+LET vT = Now();
+TRACE >>> dim_date done ($(vMinDate)..$(vMaxDate)): $(vT);
+ 
+// dim version: every budget version; version_rank drives sort + latest default
+
+// dim_version = one row per BUDGET VERSION. version_year_month is a dual value: text 'YYYY-MM', number YYYYMM,
+// so versions sort chronologically.
+dim_version:
+LOAD DISTINCT
+	version,
+    Dual(Date(MakeDate(version_year, version_month_num, 1), 'YYYY-MM'),
+		version_year*100 + version_month_num) 							AS version_year_month       
+RESIDENT stg_fin
+WHERE Len(Trim(version)) > 0;
+ 
+// vCurrentVersion = the latest version (highest YYYYMM). Plan and actuals facts are snapshotted at this
+// version. NOTE: FirstSortedValue returns NULL if two versions share the same year-month.
+tmp_curver:
+LOAD FirstSortedValue(version, -version_year_month) AS cur_version RESIDENT dim_version;
+LET vCurrentVersion = Peek('cur_version', 0, 'tmp_curver');
+DROP TABLE tmp_curver;
+TRACE >>> vCurrentVersion = $(vCurrentVersion);
+        
+// vPriorVersion = the second-latest version (used for the prior-version flag in fact_mml_history).
+tmp_priorver:
+LOAD FirstSortedValue(version, -version_year_month, 2) AS prior_version RESIDENT dim_version;
+LET vPriorVersion = Peek('prior_version', 0, 'tmp_priorver');
+DROP TABLE tmp_priorver;
+TRACE >>> vPriorVersion = $(vPriorVersion);    
+        
+// LOOKUP MAPS used when building dim_wbs (a mapping table is a fast key -> value dictionary used with ApplyMap):
+//  WBS -> program area / sub program area (hierarchy) | WBS -> program area (B&P) | project -> description |
+//  WBS -> project | WBS -> profit center.
+map_wbs_pa:
+MAPPING LOAD DISTINCT wbs_element, program_area RESIDENT stg_wbs_hier;
+map_wbs_spa:
+MAPPING LOAD DISTINCT wbs_element, sub_program_area RESIDENT stg_wbs_hier;
+map_wbs_bnp_pa:
+MAPPING LOAD DISTINCT wbs_element, program_area RESIDENT stg_bnp;
+map_proj_desc:
+MAPPING LOAD DISTINCT Left(wbs_element, 7), project_description RESIDENT stg_wbs_hier;
+map_wbs_project:
+MAPPING LOAD DISTINCT wbs_element, project RESIDENT stg_bnp;
+map_wbs_profit_center:
+MAPPING LOAD DISTINCT wbs_element, profit_center RESIDENT stg_sap;
+//////////////added below to fix profit center 10/1/2026//////////////
+
+// Fallback: profit center by 7-character project when the exact WBS has none (added 10/1/2026).
+map_project_profit_center:
+MAPPING LOAD DISTINCT Left(wbs_element, 7) AS proj, profit_center RESIDENT stg_sap;
+
+// version -> its YYYYMM. Used by fact_mml_history to flag 'actuals through the version month / forecast after'.
+map_version_cut:
+MAPPING LOAD DISTINCT version, Num(version_year_month) RESIDENT dim_version;
+
+
+// ---- WBS description lookup for WBS that have no description in stg_fin (B&P-only, AMEP-snapshot-only, SAP-only) ----
+// 1) deepest populated level of the WBS hierarchy, 2) POC project_title, 3) fall back to the code itself
+tmp_hier_desc:
+LOAD wbs_element,
+     If(Len(Trim(wbs5_description))>0, wbs5_description,
+     If(Len(Trim(wbs4_description))>0, wbs4_description,
+     If(Len(Trim(wbs3_description))>0, wbs3_description,
+     If(Len(Trim(wbs2_description))>0, wbs2_description, wbs1_description)))) AS d
+RESIDENT stg_wbs_hier;
+
+map_wbs_desc_hier:
+MAPPING LOAD DISTINCT wbs_element, d RESIDENT tmp_hier_desc WHERE Len(Trim(d))>0;
+DROP TABLE tmp_hier_desc;
+
+map_wbs_desc_poc:
+MAPPING LOAD DISTINCT wbs_element, project_title RESIDENT stg_wbs_poc WHERE Len(Trim(project_title))>0;
+
+// dim_wbs (key = wbs_element) program_area/sub_program_area sit  here
+
+// dim_wbs_base is built in 4 steps, each adding WBS not already present, so every WBS from every source exists
+// exactly once in the dimension:
+//  STEP 1  WBS in the main cost fact (stg_fin) - these carry the real WBS description. program_area: B&P view first,
+//          then hierarchy, then the fin row. sub_program_area falls back to program_area when blank.
+//          _raw_type from map_wbs_type. wbs_element_full = 'code - description', detailed_wbs_name = 'code|description'.
+dim_wbs_base:
+LOAD DISTINCT
+	wbs_element,
+    wbs_element_description,
+    ApplyMap('map_wbs_bnp_pa', wbs_element,
+    	ApplyMap('map_wbs_pa', wbs_element, program_area))				AS program_area,
+    ApplyMap('map_wbs_spa', 
+    	wbs_element, 
+    	If(Len(Trim(sub_program_area)) > 0,	
+          sub_program_area, 
+          program_area
+        )
+    )																	AS sub_program_area,
+    ApplyMap('map_wbs_type', wbs_element, '') 							AS _raw_type,
+    wbs_element & ' - ' & wbs_element_description 						AS wbs_element_full,
+    wbs_element & '|' & wbs_element_description 						AS detailed_wbs_name
+RESIDENT stg_fin;
+
+// STEP 2 prep: remember the WBS loaded so far, so only B&P WBS that are MISSING are added next.
+tmp_bnp_only:
+LOAD DISTINCT wbs_element AS %view_wbs RESIDENT stg_fin;
+
+// STEP 2  B&P-only WBS (in the B&P view but not in stg_fin). The B&P extract has no description column, so the
+// description is looked up (hierarchy, then POC title) and falls back to the code. _raw_type is fixed to 'B&P'.
+CONCATENATE(dim_wbs_base)
+LOAD DISTINCT
+	wbs_element,
+    ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS wbs_element_description,
+    ApplyMap('map_wbs_pa', wbs_element, program_area)					AS program_area,
+    ApplyMap('map_wbs_spa', wbs_element, 
+    	If(Len(Trim(sub_program_area)) > 0, 
+        	sub_program_area, program_area))							AS sub_program_area,
+//     program_area,
+// 	   If(Len(Trim(sub_program_area)) > 0, 
+//         	sub_program_area, program_area)								AS sub_program_area,
+	'B&P' AS _raw_type,
+    wbs_element & ' - ' & ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS wbs_element_full,
+    wbs_element & '|' & ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS detailed_wbs_name
+RESIDENT stg_bnp
+WHERE NOT Exists(%view_wbs, wbs_element);
+
+DROP TABLE tmp_bnp_only;
+// 10/22/2026 - CPM -  years the AMEP snapshot covers. Used later in Transform facts to turn off live AMEP plan for covered year(s)
+
+// Years covered by the AMEP January snapshot. Section 4 uses this to switch off the live AMEP plan for those years
+// so AMEP plan is not counted twice.
+tmp_amep_year: 
+LOAD DISTINCT fiscal_year AS %amep_year RESIDENT stg_amep_plan;
+
+// STEP 3 prep: remember WBS loaded so far.
+tmp_amep_seen:
+LOAD DISTINCT wbs_element AS %amep_seen RESIDENT dim_wbs_base;
+// 10/22/2026 - CPM - add AMEP WBS that only exist in the snapshot (dropped from live view) so they show under MDP/AMEP/B&P 
+
+// STEP 3  AMEP-snapshot-only WBS (dropped from the live view but still in the snapshot): shown under program area
+// 'MDP', sub program area 'AMEP', type B&P (10/22/2026 CPM).
+CONCATENATE (dim_wbs_base)
+LOAD DISTINCT 
+	wbs_element,
+    ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS wbs_element_description,
+    'MDP' AS program_area,
+    'AMEP' AS sub_program_area,
+    'B&P' AS _raw_type,
+    wbs_element & ' - ' & ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS wbs_element_full,
+    wbs_element & '|' & ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS detailed_wbs_name
+RESIDENT stg_amep_plan
+WHERE NOT Exists([%amep_seen], wbs_element);
+
+DROP TABLE tmp_amep_seen;
+ 
+// WBS -> SAP project type (YA, YC ...). Drives project_type for SAP-only WBS and has priority in dim_wbs.
+map_wbs_sap:
+MAPPING LOAD DISTINCT wbs_element, sap_proj_type RESIDENT stg_sap;
+
+// STEP 4 prep: remember WBS loaded so far.
+tmp_seen_wbs:
+LOAD DISTINCT wbs_element AS %seen_wbs RESIDENT dim_wbs_base;
+
+// STEP 4  SAP-only WBS (actuals exist in SAP but the WBS is in no other source). program_area defaults to
+// 'No Program Area'; _raw_type is the SAP project type.
+CONCATENATE(dim_wbs_base)
+LOAD DISTINCT
+	wbs_element,
+    ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS wbs_element_description,
+    ApplyMap('map_wbs_pa', wbs_element, 'No Program Area') AS program_area,
+    ApplyMap('map_wbs_spa', wbs_element, Null()) AS sub_program_area,
+    ApplyMap('map_wbs_sap', wbs_element, '') AS _raw_type,
+    wbs_element & ' - ' & ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS wbs_element_full,
+    wbs_element & '|' & ApplyMap('map_wbs_desc_hier', wbs_element, ApplyMap('map_wbs_desc_poc', wbs_element, wbs_element)) AS detailed_wbs_name
+RESIDENT stg_sap
+WHERE NOT EXISTS([%seen_wbs], wbs_element);
+
+DROP TABLE tmp_seen_wbs;
+
+// dim_wbs = FINAL WBS DIMENSION (1 row per dim_wbs_base row): adds project, F135 reporting category, profit center,
+// project description, program manager, program area and project_type. Joined with POC and hierarchy attributes below.
+dim_wbs:
+LOAD
+	wbs_element,
+    wbs_element_description,
+//     Left(wbs_element, 7) 												AS project,
+	// project = project from the B&P view if known, otherwise the first 7 characters of the WBS.
+	ApplyMap('map_wbs_project', wbs_element, Left(wbs_element, 7)) 		AS project,
+    // reporting_category = F135 grouping from map_F135; NULL for non-F135 projects.
+    ApplyMap('map_F135', Left(wbs_element, 7), Null()) 		        AS reporting_category,
+//      ApplyMap('map_F135', Left(wbs_element, 7), 'Not F135') 		        AS reporting_category,
+   // profit_center: exact WBS first, then the project's profit center, otherwise 'No Profit Center'.
+   ApplyMap('map_wbs_profit_center', wbs_element, 
+   ApplyMap('map_project_profit_center', 
+   ApplyMap('map_wbs_project', wbs_element, 
+   Left(wbs_element, 7)), 'No Profit Center'))                          AS profit_center,
+  
+//  ApplyMap('map_wbs_profit_center', wbs_element, 'No Profit Center')  AS wbs_profit_center,
+    // project_description from the hierarchy by project; 'NA' if none.
+    ApplyMap('map_proj_desc', 
+    	ApplyMap('map_wbs_project', wbs_element, 
+        Left(wbs_element, 7)), 'NA') 									AS project_description,
+    // program_manager from the PM lookup; 'No Manager' if none.
+    ApplyMap('map_wbs_pm', wbs_element, 'No Manager') 					AS program_manager,
+    program_area, 
+    sub_program_area,
+    // project_type, checked in priority order:
+    //  1) SAP project type: YA/YC/YK = E&D, YI/YR = IR&D, YB/YD/YJ = B&P
+    //  2) otherwise the raw type from other systems (same codes or the words E&D / IR&D / B&P)
+    //  3) blank = 'Unclassified'; anything else = 'Sales'.
+    // Only E&D, IR&D and B&P are kept (filter in dim_wbs_final below).
+    If(Match(ApplyMap('map_wbs_sap', wbs_element, ''), 'YA', 'YC', 'YK'), 'E&D',
+    	If(Match(ApplyMap('map_wbs_sap', wbs_element, ''), 'YI', 'YR'), 'IR&D',
+        	If(Match(ApplyMap('map_wbs_sap', wbs_element, ''), 'YB', 'YD', 'YJ'), 'B&P',
+            	If(Match([_raw_type], 'YA', 'YC', 'YK', 'E&D'), 'E&D',
+                	If(Match([_raw_type], 'YI', 'YR', 'IR&D'), 'IR&D',
+                    	If(Match([_raw_type], 'YB', 'YD', 'YJ', 'B&P'), 'B&P',
+                        	If(Len(Trim([_raw_type]))=0, 'Unclassified', 'Sales'))))))) AS project_type,
+    wbs_element_full,
+    detailed_wbs_name
+RESIDENT dim_wbs_base;
+DROP TABLE dim_wbs_base;
+
+// enrich dim_wbs with PM/FInance/POP; GROUP BY keeps it 1 row per wbs (no fan-out)
+
+// POC join: GROUP BY wbs_element + FirstValue guarantees ONE row per WBS, so the join cannot duplicate dim_wbs rows.
+LEFT JOIN(dim_wbs)
+LOAD
+	wbs_element,
+    FirstValue(project_title) 											AS project_title,
+    FirstValue(pm_name) 												AS pm_name,
+    FirstValue(finance_name) 											AS finance_name,
+    FirstValue(technical_name) 											AS technical_name,
+    FirstValue(current_year_budget) 									AS current_year_budget,
+    FirstValue(pop_start) 												AS pop_start,
+    FirstValue(pop_end) 												AS pop_end
+RESIDENT stg_wbs_poc
+GROUP BY wbs_element;
+DROP TABLE stg_wbs_poc;
+
+// HIERARCHY join: adds wbs1..wbs5 codes/descriptions, the '_full' ('code - description') versions and project_full.
+// Assumes one hierarchy row per WBS; duplicates in stg_wbs_hier would duplicate dim_wbs rows.
+LEFT JOIN(dim_wbs)
+LOAD
+	wbs_element,
+	wbs1,
+    wbs1_description,
+    wbs2,
+    wbs2_description,
+    wbs3,
+    wbs3_description,
+    wbs4,
+    wbs4_description,
+    wbs5,
+    wbs5_description,
+	wbs1 & ' - ' & wbs1_description 										AS wbs1_full,
+	wbs2 & ' - ' & wbs2_description 										AS wbs2_full,
+	wbs3 & ' - ' & wbs3_description 										AS wbs3_full,
+	wbs4 & ' - ' & wbs4_description 										AS wbs4_full,
+	wbs5 & ' - ' & wbs5_description 										AS wbs5_full,
+	Left(wbs_element, 7) & ' - ' & project_description 						AS project_full
+RESIDENT stg_wbs_hier;
+DROP TABLE stg_wbs_hier;
+
+// SMALL SAP-DERIVED DIMENSIONS: profit center, cost center and NAE (network | activity | NAE element) with the
+// composite key nae_key (turned into an integer by AUTONUMBER in section 6).
+dim_profit_center:
+LOAD DISTINCT
+	profit_center,
+    profit_center_description,
+    profit_center & ' - ' & profit_center_description 						AS profit_center_full
+RESIDENT stg_sap;
+
+dim_cost_center:
+LOAD DISTINCT
+	cost_center,
+    cost_center_text,
+    cost_center & ' - ' & cost_center_text 									AS cost_center_full
+RESIDENT stg_sap;
+
+dim_nae:
+LOAD DISTINCT
+	network & '|' & activity & '|' & nae_element 							AS nae_key,
+    nae_element,
+    nae_element_short_text,
+    network,
+    network_short_text,
+    activity,
+    activity_short_text
+RESIDENT stg_sap;
+
+// dim_internal_order: all internal orders seen in IO cost or the capital sheet, one description each (FirstValue),
+// then enriched with master data (budget, allotted, open commitment) and capital attributes (ECAR, PM, finance POC,
+// program area, budget owner).
+tmp_io:
+LOAD DISTINCT 
+    internal_order, 
+    io_description RESIDENT stg_io_cost;
+CONCATENATE(tmp_io)
+LOAD DISTINCT internal_order, io_description RESIDENT stg_io_capital;
+
+dim_internal_order:
+NOCONCATENATE LOAD 
+    internal_order, 
+    FirstValue(io_description) 												AS io_description,
+    internal_order & ' - ' & FirstValue(io_description) 					AS internal_order_full
+RESIDENT tmp_io 
+GROUP BY internal_order;
+DROP TABLE tmp_io;
+
+LEFT JOIN(dim_internal_order)
+LOAD internal_order, annual_budget, allotted, open_commitment
+RESIDENT stg_io_master;
+DROP TABLE stg_io_master;
+
+LEFT JOIN (dim_internal_order)
+LOAD
+	internal_order, 
+	FirstValue(ecar) 	AS ecar,
+    FirstValue(program_manager) AS io_program_manager,
+    FirstValue(finance_poc) AS finance_poc,
+    FirstValue(program_area) AS io_program_area,
+	FirstValue(budget_owner) AS budget_owner
+RESIDENT stg_io_capital
+GROUP BY internal_order;
+
+LET vT = Now();
+TRACE >>> dim_wbs done: $(vT);
+
+// TYPED WBS LIST: the WBS whose project_type is E&D, IR&D or B&P. Every fact and link load below uses
+// Exists(%typed_wbs, wbs_element) to ignore non-discretionary WBS.
+tmp_typed_wbs:
+LOAD DISTINCT 
+	wbs_element AS %typed_wbs 
+RESIDENT dim_wbs 
+WHERE Match(project_type, 'E&D', 'IR&D', 'B&P');
+
+// dim_opportunity = B&P opportunities; label = 'MP number - opportunity'.
+dim_opportunity:
+LOAD Distinct
+	opportunity_number,
+    opportunity 															AS opportunity_name,
+	mp_number,
+    If(Len(mp_number) > 0, mp_number & ' - ', '') & opportunity 			AS opportunity_label
+RESIDENT stg_bnp
+WHERE Len(Trim(opportunity_number)) > 0; 
+
+// WBS -> OPPORTUNITY MAP: if a WBS has exactly ONE opportunity (min = max) map_wbs_opp returns it, otherwise ''.
+// This lets non-B&P facts (SAP, fin) attach to the single opportunity when it is unambiguous. It is part of every
+// link key, so changing it changes the keys.
+tmp_opp_span:
+LOAD wbs_element,
+	MinString(opportunity_number) 											AS opp_min,
+    MaxString(opportunity_number) 											AS opp_max
+RESIDENT stg_bnp
+WHERE Len(Trim(opportunity_number)) > 0
+GROUP BY wbs_element;
+
+map_wbs_opp:
+MAPPING LOAD wbs_element, If(opp_min = opp_max, opp_min, '') 				AS opportunity_number 
+RESIDENT tmp_opp_span;
+DROP TABLE tmp_opp_span;
+
+// Keep only E&D / IR&D / B&P WBS: copy to dim_wbs_final, drop the unfiltered dim_wbs, rename.
+dim_wbs_final:
+NOCONCATENATE 
+LOAD *
+RESIDENT dim_wbs
+WHERE Match(project_type, 'E&D', 'IR&D', 'B&P');
+DROP TABLE dim_wbs;
+RENAME TABLE dim_wbs_final TO dim_wbs;
+    
+
+/* Four Facts Split by versioning behavior. Explicit *_amount measures.
+actuals/plan are version-invariant -> snapshot at vCurrentVersion. */
+
+// SECTION Tab 4 -  Tranform FACTS /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// fact_wbs_month = WBS x month facts built from FIVE sources stacked with CONCATENATE. Each row has only %link_key
+// plus the measure(s) of its own source; every other column is NULL, so Sum(measure) simply adds the right rows.
+// %link_key = wbs | YYYYMM | | | opportunity.
+// SOURCE 1: plan from the CURRENT version of the fin view -> plan_amount.
+fact_wbs_month:
+LOAD
+	wbs_element & '|' & fiscal_year & Num(fiscal_period_month_num, '00') 
+    	& '|||' & ApplyMap('map_wbs_opp', wbs_element, '') 						AS %link_key,
+	Num(plan_cost) 																AS plan_amount
+RESIDENT stg_fin
+WHERE version = '$(vCurrentVersion)'
+AND Exists(%typed_wbs, wbs_element);
+
+// SOURCE 2: SAP actuals and PV0 -> actual_amount, pv0_amount, plus cost_center, nae_key, sap_proj_type,
+// profitability_metric. Before the close day the current month's actuals are forced to 0 (partial month).
+CONCATENATE(fact_wbs_month)
+LOAD
+	wbs_element & '|' & fiscal_year & Num(fiscal_period_month, '00') 
+    	& '|||' & ApplyMap('map_wbs_opp', wbs_element, '') 						AS %link_key,
+        
+//////////////Commented line below to fix profit center allignment//////////////////////////////////////        
+//	profit_center,
+    cost_center,
+	network & '|' & activity & '|' & nae_element 								AS nae_key,
+	sap_proj_type,
+    profitability_metric,
+    If( 
+    	$(vZeroPartialMonth)=1 	AND 
+    	$(vBeforeClose)=1		AND 
+        fiscal_year=$(vCurYear)	AND 
+        fiscal_period_month=$(vCurMonth),
+        0, 
+        Num(actual_cost_raw))   												AS actual_amount,
+	Num(pv0_cost_raw) 															AS pv0_amount
+RESIDENT stg_sap; 
+
+// SOURCE 3: B&P plan and MML -> plan_amount, mml_amount (this month onward only = 'To Go'), mml_amount_all (all
+// months). AMEP plan is set to NULL for years covered by the January snapshot (SOURCE 5 supplies it instead).
+CONCATENATE(fact_wbs_month)
+LOAD 
+	wbs_element & '|' & fiscal_year & Num(fiscal_period_month_num, '00') 
+    	& '|||' & opportunity_number 											AS [%link_key], 
+    If(
+    	sub_program_area = 'AMEP' AND Exists(%amep_year, fiscal_year),          // 10/22/2026 - CPM - AMEP plan now comes from the snapshot block below; nulled here so we don't double count it
+    	Null(), 
+    	Num(plan_cost)
+    )    																		AS plan_amount,
+    If(fiscal_year > $(vCurYear)
+    	OR (fiscal_year = $(vCurYear) 
+        	AND fiscal_period_month_num >= $(vCurMonth)),
+        Num(mml_cost))															AS mml_amount,
+    Num(mml_cost)															    AS mml_amount_all
+RESIDENT stg_bnp;
+
+// SOURCE 4: prior-year plan and MML from pme_mml_cost_data.
+CONCATENATE(fact_wbs_month)
+LOAD
+	wbs_element & '|' & fiscal_year & Num(fiscal_period_month_num, '00') 
+    	& '|||' & ApplyMap('map_wbs_opp', wbs_element, '') 						AS %link_key,
+    Num(plan_cost) 																AS plan_amount,
+    If(fiscal_year > $(vCurYear)
+    	OR (fiscal_year = $(vCurYear) 
+        	AND fiscal_period_month_num >= $(vCurMonth)),
+        Num(mml_cost))															AS mml_amount,
+    Num(mml_cost)																AS mml_amount_all
+RESIDENT stg_mml_prior
+WHERE Exists(%typed_wbs, wbs_element);
+// 10/22/2026 - CPM - AMEP plan from the Jan snapshot. Replaces the live AMEP plan blanked above in the stg_bnp block
+
+// SOURCE 5: AMEP plan from the January snapshot (10/22/2026 CPM).
+CONCATENATE(fact_wbs_month)
+LOAD 
+	wbs_element & '|' & fiscal_year & Num(fiscal_period_month_num, '00') & 
+    '|||' & ApplyMap('map_wbs_opp', wbs_element, '') 							AS [%link_key], 
+    Num(plan_cost) 																AS plan_amount
+RESIDENT stg_amep_plan
+WHERE EXISTS(%typed_wbs, wbs_element);
+
+/////////////////////////////////////////////////// add below on 9/29/2026 to add history mml 
+
+// SOURCE 6 (9/29/2026): historical MML - for every version, the value of that version's own month
+// (version year/month = fiscal year/month) -> mml_amount_all.
+CONCATENATE(fact_wbs_month)
+LOAD
+ wbs_element & '|' & fiscal_year & Num(fiscal_period_month_num, '00') 
+        & '|||' & ApplyMap('map_wbs_opp', wbs_element, '')       AS %link_key, 
+    Num(mml_cost)                 AS mml_amount_all 
+RESIDENT stg_fin 
+WHERE version_year = fiscal_year 
+    AND version_month_num = fiscal_period_month_num AND EXISTS(%typed_wbs, wbs_element);
+    
+ ////////////////////////////////////////////////   
+
+// fact_allocation_year = ANNUAL PROGRAM ALLOCATION (WBS x year x opportunity). Key wbs|||YYYY|opp.
+// Source A: live cost-data allocation.
+fact_allocation_year:
+LOAD
+	wbs_element & '|||' & fiscal_year 
+    & '|' & ApplyMap('map_wbs_opp', wbs_element, '') 							AS %link_key,
+    Num(fiscal_year_program_allocation) 										AS allocation_amount
+RESIDENT stg_alloc_cur
+WHERE Exists(%typed_wbs, wbs_element);
+
+// Source B: B&P annual budget used as allocation.
+CONCATENATE(fact_allocation_year)
+LOAD
+	wbs_element & '|||' & fiscal_year & '|' & opportunity_number 				AS [%link_key],
+    NUM(fiscal_year_program_allocation) 										AS allocation_amount
+RESIDENT stg_bnp_alloc
+WHERE EXISTS([%typed_wbs],wbs_element);
+
+// fact_mml_history = MML and actuals for EVERY VERSION x month (key wbs|YYYYMM|version|).
+//  forecast_as_of_flag = 1 for the version's own month and, for the current version, every later month (the 'forecast' part).
+//  prior_version_flag / current_version_flag identify the two latest versions.
+fact_mml_history:
+LOAD 
+	wbs_element & '|' & 
+    	fiscal_year & 
+        Num(fiscal_period_month_num, '00') & '|' & version & '|'				AS %link_key,
+	Num(mml_cost)																AS mml_amount_hist,
+    If(fiscal_year * 100 + fiscal_period_month_num = ApplyMap('map_version_cut', version, 0) 
+        OR (version = '$(vCurrentVersion)' 
+        AND fiscal_year * 100 + fiscal_period_month_num > 
+        	ApplyMap('map_version_cut', version, 0)),1,0)						AS forecast_as_of_flag,
+        If(version = '$(vPriorVersion)', 1, 0) 									AS prior_version_flag,
+        If(version = '$(vCurrentVersion)', 1, 0) 								AS current_version_flag,
+        Num(actual_cost) 														AS actual_amount_hist
+RESIDENT stg_fin
+WHERE Exists(%typed_wbs, wbs_element);
+
+// fact_allocation_history = annual allocation per VERSION (key wbs||version|YYYY).
+fact_allocation_history:
+LOAD
+	wbs_element & '||' & version & '|' & fiscal_year							AS %link_key,
+    Num(fiscal_year_program_allocation)											AS allocation_amount_hist
+RESIDENT stg_alloc
+WHERE Exists(%typed_wbs, wbs_element);
+
+// fact_io_month = INTERNAL-ORDER facts, key io|order|YYYYMM. Part 1: actual cost by order x month.
+fact_io_month:
+LOAD
+	'io|' & internal_order & '|' & fiscal_year & Num(fiscal_period_month, '00') AS [%link_key], 
+	Sum(actual_cost) 															AS io_actual_amount
+RESIDENT stg_io_cost
+GROUP BY internal_order, fiscal_year, fiscal_period_month;
+
+// Part 2: capital-sheet measures: io_mml_amount (this month onward), io_mml_amount_all, io_plan_amount,
+// io_program_allocation_amount.
+CONCATENATE(fact_io_month)
+LOAD
+	'io|' & internal_order & '|' & fiscal_year & Num(fiscal_period_month, '00') AS [%link_key],
+    If(fiscal_year > $(vCurYear)
+		OR (fiscal_year = $(vCurYear) AND fiscal_period_month >= $(vCurMonth)),
+		Num(mml_cost)) 	 														AS io_mml_amount,
+    Num(mml_cost)																AS io_mml_amount_all,
+	Num(plan_cost)																AS io_plan_amount,
+    Num(program_allocation_cost) AS io_program_allocation_amount
+RESIDENT stg_io_capital;
+
+LET vT = Now();
+TRACE >>> facts done: $(vT);
+
+
+// SECTION Tab 5 - LINK TABLE //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// link_table has one row per distinct %link_key and holds the dimension values that key stands for (wbs_element,
+// opportunity_number, year_month, version, fiscal_year, internal_order). Facts reach the dimensions ONLY through it.
+// Each block below mirrors one fact load: same key expression, same filter. If a fact block is changed, change its
+// link block too. Annual facts are expanded to 12 rows (WHILE IterNo() <= 12) so a month selection still finds them.
+// LINK 1: monthly keys at the current version (fact_wbs_month sources 1 and 6 / stg_fin).
+link_table:
+LOAD DISTINCT
+	wbs_element & '|' & fiscal_year & Num(fiscal_period_month_num, '00') 
+    	& '|||' & ApplyMap('map_wbs_opp', wbs_element, '') 						AS [%link_key],
+	wbs_element,
+    ApplyMap('map_wbs_opp', wbs_element, '') AS opportunity_number,
+    fiscal_year*100 + fiscal_period_month_num		 							AS year_month,
+    Null() 																		AS version,
+    fiscal_year
+RESIDENT stg_fin
+WHERE version = '$(vCurrentVersion)'
+AND Exists(%typed_wbs, wbs_element);
+
+// LINK 2: versioned MML history keys (fact_mml_history).
+CONCATENATE(link_table)
+LOAD DISTINCT 
+	wbs_element & '|' & 
+    fiscal_year & 
+    Num(fiscal_period_month_num, '00') & '|' & 
+    version & '|'																AS [%link_key],
+	wbs_element,
+	fiscal_year*100 + fiscal_period_month_num 									AS year_month,
+	version,
+	fiscal_year
+RESIDENT stg_fin
+WHERE Exists(%typed_wbs, wbs_element);
+
+// LINK 3: allocation history keys, expanded to 12 months (fact_allocation_history).
+CONCATENATE(link_table)
+LOAD DISTINCT
+	[%link_key],
+	wbs_element,
+	fiscal_year*100 + IterNo() 													AS year_month,
+    version,
+	fiscal_year
+WHILE IterNo() <= 12;
+LOAD
+	wbs_element & '||' & version & '|' & fiscal_year 							AS [%link_key],	
+	wbs_element,
+	version,
+	fiscal_year
+RESIDENT stg_alloc
+WHERE Exists(%typed_wbs, wbs_element);
+
+// LINK 4: annual allocation keys, opportunity from the map, expanded to 12 months (fact_allocation_year A).
+CONCATENATE(link_table)
+LOAD DISTINCT
+	[%link_key],
+	wbs_element,
+    opportunity_number,
+	fiscal_year*100 + IterNo()  												AS year_month,
+    version,
+	fiscal_year
+WHILE IterNo() <= 12;
+LOAD
+	wbs_element & '|||' & 
+    	fiscal_year & '|' & 
+        ApplyMap('map_wbs_opp', wbs_element, '') 								AS [%link_key],	
+	wbs_element,
+    ApplyMap('map_wbs_opp', wbs_element, '') 									AS opportunity_number,
+	Null() AS version,
+	fiscal_year
+RESIDENT stg_alloc_cur
+WHERE Exists(%typed_wbs, wbs_element);
+
+// LINK 5: annual B&P allocation keys, expanded to 12 months (fact_allocation_year B).
+CONCATENATE(link_table)
+LOAD DISTINCT
+	[%link_key],
+    wbs_element,
+    opportunity_number,
+    fiscal_year*100 + IterNo() 													AS year_month,
+    version,
+    fiscal_year
+WHILE IterNo() <= 12;
+LOAD DISTINCT
+	wbs_element & '|||' & 
+    	fiscal_year & '|' & 
+        opportunity_number 														AS [%link_key],
+    wbs_element,
+    opportunity_number,
+    Null() AS version,
+    fiscal_year
+RESIDENT stg_bnp_alloc
+WHERE EXISTS([%typed_wbs], wbs_element);
+
+// LINK 6: SAP month keys (fact_wbs_month source 2).
+CONCATENATE(link_table)
+LOAD DISTINCT
+	wbs_element & '|' &
+    	fiscal_year & 
+        Num(fiscal_period_month, '00') & '|||' &
+        ApplyMap('map_wbs_opp', wbs_element, '') 								AS [%link_key],
+	wbs_element,
+    ApplyMap('map_wbs_opp', wbs_element, '') 									AS opportunity_number,
+    fiscal_year*100 + fiscal_period_month  										AS year_month,
+	Null()  																	AS version,
+	fiscal_year
+RESIDENT stg_sap;
+
+// LINK 7: B&P month keys (fact_wbs_month source 3).
+CONCATENATE(link_table)
+LOAD DISTINCT 
+	wbs_element & '|' & 
+    	fiscal_year & 
+        Num(fiscal_period_month_num, '00') & '|||' & 
+        opportunity_number 														AS [%link_key],
+    wbs_element,
+    opportunity_number,
+    fiscal_year*100+fiscal_period_month_num AS year_month,
+    Null() AS version,
+    fiscal_year
+RESIDENT stg_bnp;
+
+// LINK 8: prior-year MML month keys (source 4). NOTE: the NOT EXISTS test on [%link_key] looks at the whole field,
+// which already holds every fact_wbs_month key, so this block most likely adds 0 rows. Kept as is.
+CONCATENATE(link_table)
+LOAD DISTINCT
+	wbs_element & '|' & 
+    	fiscal_year & 
+        Num(fiscal_period_month_num, '00') & '|||' &
+        ApplyMap('map_wbs_opp', wbs_element, '') 									AS [%link_key],
+    wbs_element,
+    ApplyMap('map_wbs_opp', wbs_element, '') 									AS opportunity_number,
+    fiscal_year*100 + fiscal_period_month_num 									AS year_month,
+    Null() AS version,
+    fiscal_year
+RESIDENT stg_mml_prior
+WHERE Exists(%typed_wbs, wbs_element)
+AND NOT EXISTS([%link_key], 
+	wbs_element & '|' &
+	fiscal_year &
+	Num(fiscal_period_month_num, '00') & '|||' &
+    ApplyMap('map_wbs_opp', wbs_element, '')
+);
+// above is intended to supress keys already created in the fin block and avoid forcasting issues
+// 10/22/2026 - CPM -  link rows for AMEP snapshot WBS that don't have one yet (the dropped WBS returned in Jan snapshot view). tmp_link_seen drops duplicate keys
+
+// LINK 9 prep: keys already IN link_table (separate field %link_seen so the check really sees link_table only).
+tmp_link_seen:
+LOAD DISTINCT [%link_key] AS %link_seen RESIDENT link_table;
+
+// LINK 9: AMEP snapshot month keys not yet in link_table (10/22/2026 CPM).
+CONCATENATE(link_table)
+LOAD DISTINCT
+	wbs_element & '|' &
+    	fiscal_year &
+        Num(fiscal_period_month_num, '00') & '|||' &
+        ApplyMap('map_wbs_opp', wbs_element, '') AS [%link_key],
+        wbs_element,
+        ApplyMap('map_wbs_opp', wbs_element, '') AS opportunity_number,
+        fiscal_year * 100 + fiscal_period_month_num AS year_month,
+        Null() AS version, 
+        fiscal_year
+RESIDENT stg_amep_plan
+WHERE Exists(%typed_wbs, wbs_element)
+AND NOT Exists(%link_seen, wbs_element & '|' &
+          fiscal_year &
+          Num(fiscal_period_month_num, '00') & '|||' &
+          ApplyMap('map_wbs_opp', wbs_element, '')
+    	);
+        
+DROP TABLE tmp_link_seen;
+
+// LINK 10: internal-order actual cost month keys.
+CONCATENATE(link_table)
+LOAD DISTINCT
+	'io|' & 
+    	internal_order & '|' & 
+    	fiscal_year &
+        Num(fiscal_period_month, '00') 											AS [%link_key],
+    internal_order,
+    fiscal_year*100+fiscal_period_month  										AS year_month,
+    fiscal_year
+RESIDENT stg_io_cost;
+
+// LINK 11: internal-order capital-sheet month keys.
+CONCATENATE(link_table)
+LOAD DISTINCT
+	'io|' & 
+    	internal_order & '|' & 
+        fiscal_year & 
+        Num(fiscal_period_month, '00')											AS [%link_key],
+    internal_order,
+    fiscal_year*100+fiscal_period_month  										AS year_month,
+    fiscal_year
+RESIDENT stg_io_capital;
+// 10/22/2026 - CPM - Added trailing 3 table names 
+
+// Staging tables are no longer needed - free the memory. Dimensions, facts and link_table remain.
+DROP TABLES stg_fin, stg_alloc, stg_alloc_cur, stg_sap, stg_io_cost, stg_io_capital, stg_bnp, stg_bnp_alloc, stg_mml_prior, tmp_typed_wbs, stg_amep_plan, tmp_amep_year;
+
+LET vT = Now();
+TRACE >>> link_table done: $(vT);
+
+
+// SECTION Tab 6 - STORE AND EXIT /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// AUTONUMBER replaces the long text keys (%link_key, nae_key) with integers in every table: smaller QVDs, faster joins.
+// The numbers change every reload - never compare or hard-code them.
+AUTONUMBER [%link_key], nae_key;
+
+// Write the 14 model QVDs that the dashboard app loads.
+STORE dim_date					INTO [$(vFinQvds)/dim_date.qvd](qvd);
+STORE dim_version				INTO [$(vFinQvds)/dim_version.qvd](qvd);
+STORE dim_wbs					INTO [$(vFinQvds)/dim_wbs.qvd](qvd);
+STORE dim_profit_center			INTO [$(vFinQvds)/dim_profit_center.qvd](qvd);
+STORE dim_cost_center			INTO [$(vFinQvds)/dim_cost_center.qvd](qvd);
+STORE dim_nae					INTO [$(vFinQvds)/dim_nae.qvd](qvd);
+STORE dim_internal_order		INTO [$(vFinQvds)/dim_internal_order.qvd](qvd);
+STORE dim_opportunity           INTO [$(vFinQvds)/dim_opportunity.qvd](qvd);
+STORE fact_wbs_month			INTO [$(vFinQvds)/fact_wbs_month.qvd](qvd);
+STORE fact_allocation_year		INTO [$(vFinQvds)/fact_allocation_year.qvd](qvd);
+STORE fact_io_month				INTO [$(vFinQvds)/fact_io_month.qvd](qvd);
+STORE fact_allocation_history	INTO [$(vFinQvds)/fact_allocation_history.qvd](qvd);
+STORE fact_mml_history			INTO [$(vFinQvds)/fact_mml_history.qvd](qvd);
+STORE link_table 				INTO [$(vFinQvds)/link_table.qvd](qvd);
+
+// Drop every table from this app after storing: the QVDGEN app is only a generator and keeps no data in memory.
+// TableName(0) is always the first remaining table, so the loop empties the model.
+LET vL.NumTabelle = NoOfTables();
+
+FOR j=0 to $(vL.NumTabelle)-1
+
+LET vL.nomeTabella = TableName(0);
+
+  DROP Table [$(vL.nomeTabella)];
+
+NEXT j;
+
+LET vT = Now();
+TRACE >>> Load complete: $(vT);
+
+Exit Script;
+
+
